@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from flask import Blueprint, render_template, request, send_file, current_app
+from flask import Blueprint, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 from PIL import Image
@@ -53,38 +53,59 @@ def _flatten_alpha_for_jpeg(im: Image.Image) -> Image.Image:
     return im
 
 
+def _save_image_bytes(im: Image.Image, fmt: str, **save_kwargs) -> bytes:
+    out = io.BytesIO()
+    im.save(out, format=fmt, **save_kwargs)
+    return out.getvalue()
+
+
+def _smallest_lossless_tiff(im: Image.Image) -> bytes:
+    """Try multiple lossless TIFF compressions and keep the smallest."""
+    candidates = [
+        _save_image_bytes(im, "TIFF", compression="tiff_lzw"),
+        _save_image_bytes(im, "TIFF", compression="tiff_adobe_deflate"),
+    ]
+
+    # PackBits can help for flat-color graphics.
+    try:
+        candidates.append(_save_image_bytes(im, "TIFF", compression="packbits"))
+    except Exception:
+        pass
+
+    return min(candidates, key=len)
+
+
 def _convert_image_bytes(src_bytes: bytes, out_fmt: str, quality: int) -> bytes:
     out_fmt = out_fmt.upper()
 
     with Image.open(io.BytesIO(src_bytes)) as im:
-        # Normalize for some formats
+        # Respect requested quality; do not silently degrade output.
         if out_fmt in ("JPG", "JPEG"):
-            im = _flatten_alpha_for_jpeg(im)
-            out = io.BytesIO()
-            im.save(out, format="JPEG", quality=quality, optimize=True)
-            return out.getvalue()
+            base = _flatten_alpha_for_jpeg(im)
+            return _save_image_bytes(base, "JPEG", quality=quality, optimize=True, progressive=True)
 
         if out_fmt == "WEBP":
-            out = io.BytesIO()
-            im.save(out, format="WEBP", quality=quality, method=6)  # method=6 = slower/better compression
-            return out.getvalue()
+            return _save_image_bytes(im, "WEBP", quality=quality, method=6)
 
         if out_fmt == "PNG":
-            out = io.BytesIO()
-            im.save(out, format="PNG", optimize=True)
-            return out.getvalue()
+            # Keep PNG visually faithful; only use lossless compression.
+            return _save_image_bytes(im, "PNG", optimize=True, compress_level=9)
+
+        if out_fmt == "TIFF":
+            # Keep TIFF visually faithful; use best lossless compression.
+            return _smallest_lossless_tiff(im)
+
+        if out_fmt == "BMP":
+            # BMP is inherently large (mostly uncompressed).
+            return _save_image_bytes(im, "BMP")
 
         if out_fmt == "HEIC":
             if not HEIF_AVAILABLE:
                 raise ValueError("HEIC support not available on server")
-            out = io.BytesIO()
-            im.save(out, format="HEIC", quality=quality)
-            return out.getvalue()
+            return _save_image_bytes(im, "HEIC", quality=quality)
 
         # Default
-        out = io.BytesIO()
-        im.save(out, format=out_fmt)
-        return out.getvalue()
+        return _save_image_bytes(im, out_fmt)
 
 
 def _allowed_file(filename: str) -> bool:

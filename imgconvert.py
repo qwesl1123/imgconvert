@@ -12,12 +12,20 @@ from werkzeug.utils import secure_filename
 
 from PIL import Image
 
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    HEIF_AVAILABLE = True
+except Exception:
+    HEIF_AVAILABLE = False
+
 bp = Blueprint("imgconvert", __name__, url_prefix="/imgconvert")
 
 # Common formats Pillow can write (you can extend)
-OUTPUT_FORMATS = ["PNG", "JPEG", "WEBP", "BMP", "TIFF"]
+OUTPUT_FORMATS = ["PNG", "JPEG", "WEBP", "BMP", "TIFF", "HEIC"]
 INPUT_EXT_ALLOWLIST = {
-    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".ico"
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".ico", ".heic", ".heif"
 }
 
 # Safety limits (tune to your server)
@@ -66,6 +74,13 @@ def _convert_image_bytes(src_bytes: bytes, out_fmt: str, quality: int) -> bytes:
             im.save(out, format="PNG", optimize=True)
             return out.getvalue()
 
+        if out_fmt == "HEIC":
+            if not HEIF_AVAILABLE:
+                raise ValueError("HEIC support not available on server")
+            out = io.BytesIO()
+            im.save(out, format="HEIC", quality=quality)
+            return out.getvalue()
+
         # Default
         out = io.BytesIO()
         im.save(out, format=out_fmt)
@@ -108,6 +123,9 @@ def convert():
     to_fmt = (request.form.get("to") or "WEBP").upper()
     if to_fmt not in OUTPUT_FORMATS and to_fmt not in ("JPG",):
         return "Unsupported output format", 400
+
+    if to_fmt == "HEIC" and not HEIF_AVAILABLE:
+        return "HEIC output is not enabled on this server", 400
 
     try:
         quality = int(request.form.get("quality") or "85")

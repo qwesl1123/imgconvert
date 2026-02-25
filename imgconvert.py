@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import io
+import os
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from flask import Blueprint, render_template, request, send_file, current_app
+from werkzeug.utils import secure_filename
+
+from PIL import Image
+
+bp = Blueprint("imgconvert", __name__, url_prefix="/imgconvert")
+
+# Common formats Pillow can write (you can extend)
+OUTPUT_FORMATS = ["PNG", "JPEG", "WEBP", "BMP", "TIFF"]
+INPUT_EXT_ALLOWLIST = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".ico"
+}
+
+# Safety limits (tune to your server)
+MAX_FILES = 50
+MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50MB total upload
+MAX_IMAGE_PIXELS = 40_000_000       # helps avoid decompression bomb
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+
+@dataclass
+class ConvertResult:
+    filename: str
+    ok: bool
+    message: str
+
+
+def _flatten_alpha_for_jpeg(im: Image.Image) -> Image.Image:
+    # JPEG doesn't support alpha. Flatten onto white.
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        im = Image.alpha_composite(bg, im).convert("RGB")
+    else:
+        im = im.convert("RGB")
+    return im
+
+
+def _convert_image_bytes(src_bytes: bytes, out_fmt: str, quality: int) -> bytes:
+    out_fmt = out_fmt.upper()
+
+    with Image.open(io.BytesIO(src_bytes)) as im:
+        # Normalize for some formats
+        if out_fmt in ("JPG", "JPEG"):
+            im = _flatten_alpha_for_jpeg(im)
+            out = io.BytesIO()
+            im.save(out, format="JPEG", quality=quality, optimize=True)
+            return out.getvalue()
+
+        if out_fmt == "WEBP":
+            out = io.BytesIO()
+            im.save(out, format="WEBP", quality=quality, method=6)  # method=6 = slower/better compression
+            return out.getvalue()
+
+        if out_fmt == "PNG":
+            out = io.BytesIO()
+            im.save(out, format="PNG", optimize=True)
+            return out.getvalue()
+
+        # Default
+        out = io.BytesIO()
+        im.save(out, format=out_fmt)
+        return out.getvalue()
+
+
+def _allowed_file(filename: str) -> bool:
+    ext = Path(filename).suffix.lower()
+    return ext in INPUT_EXT_ALLOWLIST
+
+
+def _total_upload_size(files: Iterable) -> int:
+    total = 0
+    for f in files:
+        # Werkzeug FileStorage may not have content_length reliably; measure by seeking.
+        pos = f.stream.tell()
+        f.stream.seek(0, os.SEEK_END)
+        total += f.stream.tell()
+        f.stream.seek(pos)
+    return total
+
+
+@bp.route("/", methods=["GET"])
+def page():
+    return render_template("imgconvert.html", output_formats=OUTPUT_FORMATS)
+
+
+@bp.route("/convert", methods=["POST"])
+def convert():
+    """
+    Accepts single or multiple files:
+      form-data:
+        files: (one or many)
+        to: PNG|JPEG|WEBP|...
+        quality: 1-100 (for JPEG/WEBP)
+    Returns:
+      - if 1 file: converted file download
+      - if >1 file: zip download
+    """
+    to_fmt = (request.form.get("to") or "WEBP").upper()
+    if to_fmt not in OUTPUT_FORMATS and to_fmt not in ("JPG",):
+        return "Unsupported output format", 400
+
+    try:
+        quality = int(request.form.get("quality") or "85")
+        quality = max(1, min(100, quality))
+    except Exception:
+        quality = 85
+
+    files = request.files.getlist("files")
+    if not files:
+        return "No files uploaded", 400
+
+    if len(files) > MAX_FILES:
+        return f"Too many files (max {MAX_FILES})", 400
+
+    total_size = _total_upload_size(files)
+    if total_size > MAX_TOTAL_BYTES:
+        return f"Total upload too large (max {MAX_TOTAL_BYTES // (1024*1024)}MB)", 400
+
+    # Convert all; collect results
+    converted = []
+    results: list[ConvertResult] = []
+
+    for f in files:
+        original_name = f.filename or "unnamed"
+        safe_name = secure_filename(original_name) or "file"
+        if not _allowed_file(safe_name):
+            results.append(ConvertResult(original_name, False, "Unsupported input type"))
+            continue
+
+        try:
+            f.stream.seek(0)
+            src_bytes = f.read()
+            out_bytes = _convert_image_bytes(src_bytes, to_fmt, quality)
+
+            stem = Path(safe_name).stem
+            out_ext = ".jpg" if to_fmt in ("JPEG", "JPG") else f".{to_fmt.lower()}"
+            out_name = f"{stem}{out_ext}"
+
+            converted.append((out_name, out_bytes))
+            results.append(ConvertResult(original_name, True, f"Converted → {to_fmt}"))
+        except Exception as e:
+            results.append(ConvertResult(original_name, False, f"Failed: {e}"))
+
+    # If only one successful conversion, return the file directly
+    ok_items = [(n, b) for (n, b) in converted]
+    if len(ok_items) == 1 and len(files) == 1:
+        name, data = ok_items[0]
+        return send_file(
+            io.BytesIO(data),
+            as_attachment=True,
+            download_name=name,
+            mimetype="application/octet-stream",
+        )
+
+    # Otherwise return a zip (also include a results.txt)
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for name, data in ok_items:
+            z.writestr(name, data)
+
+        report_lines = []
+        for r in results:
+            status = "OK" if r.ok else "ERR"
+            report_lines.append(f"{status} - {r.filename} - {r.message}")
+        z.writestr("results.txt", "\n".join(report_lines))
+
+    zip_buf.seek(0)
+    return send_file(
+        zip_buf,
+        as_attachment=True,
+        download_name=f"converted_{to_fmt.lower()}.zip",
+        mimetype="application/zip",
+    )

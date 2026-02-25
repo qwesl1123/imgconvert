@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Image Converter</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; padding: 20px; max-width: 900px; margin: 0 auto; }
+    .row { margin: 12px 0; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    label { min-width: 110px; }
+    input, select, button { padding: 10px; }
+    .hint { color: #555; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>Image Converter</h1>
+  <p class="hint">Upload one image or multiple images. Multiple downloads come as a ZIP.</p>
+
+  <form action="/imgconvert/convert" method="post" enctype="multipart/form-data">
+    <div class="row">
+      <label>Files</label>
+      <input type="file" name="files" multiple required />
+    </div>
+
+    <div class="row">
+      <label>Convert to</label>
+      <select name="to">
+        {% for fmt in output_formats %}
+          <option value="{{ fmt }}">{{ fmt }}</option>
+        {% endfor %}
+      </select>
+
+      <label>Quality</label>
+      <input type="number" name="quality" value="85" min="1" max="100" />
+      <span class="hint">(JPEG/WEBP only)</span>
+    </div>
+
+    <div class="row">
+      <button type="submit">Convert</button>
+    </div>
+  </form>
+</body>
+</html>
